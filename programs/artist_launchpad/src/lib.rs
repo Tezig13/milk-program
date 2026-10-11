@@ -26,6 +26,11 @@ use anchor_spl::token_interface::{transfer_checked, Mint, TokenAccount, TokenInt
 
 declare_id!("Df5CVncF1g3erUdfa3aGJUUxHELXqnDK3kHzZa33Rrmr");
 
+// Meteora DAMM v2 (cp-amm), from its IDL (idls/damm_v2.json): where a completed curve's liquidity goes.
+declare_program!(damm_v2);
+use damm_v2::types::{BaseFeeParameters, InitializeCustomizablePoolParameters, PoolFeeParameters};
+use ruint::aliases::U256;
+
 pub const DECIMALS: u8 = 6;
 /// 1B tokens, 6 decimals.
 pub const TOTAL_SUPPLY: u64 = 1_000_000_000 * 1_000_000;
@@ -38,6 +43,19 @@ pub const ARTIST_SEED: &[u8] = b"artist";
 pub const SONG_SEED: &[u8] = b"song";
 pub const CURVE_SEED: &[u8] = b"curve";
 pub const TREASURY_SEED: &[u8] = b"treasury";
+/// Per-token system PDA that creates and owns the DAMM v2 pool position (it can pay rent and sign).
+pub const MIGRATOR_SEED: &[u8] = b"migrator";
+
+/// Pool trading fee on DAMM v2: 1%, like the curve (fee numerator over 1e9).
+pub const POOL_FEE_NUMERATOR: u64 = 10_000_000;
+/// Rent the migrator needs to create the pool, its vaults and the position.
+pub const MIGRATION_RENT: u64 = 60_000_000;
+/// DAMM v2 constants (cp-amm): price bounds (Q64.64 sqrt price) and the liquidity it locks forever in a compounding pool.
+pub const DAMM_MIN_SQRT_PRICE: u128 = 4_295_048_016;
+pub const DAMM_MAX_SQRT_PRICE: u128 = 79_226_673_521_066_979_257_578_248_091;
+pub const DAMM_DEAD_LIQUIDITY: u128 = 100 << 64;
+/// CollectFeeMode::Compounding: constant product over the whole price range, fees claimable in token B (the quote).
+pub const COLLECT_FEE_COMPOUNDING: u8 = 2;
 
 pub const KIND_ARTIST: u8 = 0;
 pub const KIND_SONG: u8 = 1;
@@ -352,6 +370,176 @@ pub mod artist_launchpad {
         emit!(TreasurySpent { artist_mint: mint, quote_mint: ctx.accounts.quote_mint.key(), amount, memo });
         Ok(())
     }
+
+    /// Graduation: once a curve is sold out, anyone can move its liquidity to a Meteora DAMM v2 pool (token / quote,
+    /// x·y = k, 1% fee collected in the quote). The pool position is owned by the program and locked forever; its fees
+    /// keep being split 30/40/30 through `claim_pool_fees`. The caller funds the rent (MIGRATION_RENT).
+    pub fn migrate(ctx: Context<Migrate>) -> Result<()> {
+        let curve = &ctx.accounts.curve;
+        require!(curve.complete, LaunchpadError::CurveNotComplete);
+        require!(!curve.migrated, LaunchpadError::AlreadyMigrated);
+        let base_amount = ctx.accounts.base_vault.amount;
+        let quote_amount = curve.real_quote;
+        let mint = curve.mint;
+        let curve_seeds: &[&[&[u8]]] = &[&[CURVE_SEED, mint.as_ref(), &[curve.bump]]];
+
+        // Reserves to the migrator (the accrued fees stay in the curve vault, claimable as before).
+        for (from, to, m, amount, decimals, program) in [
+            (&ctx.accounts.base_vault, &ctx.accounts.migrator_base, ctx.accounts.base_mint.to_account_info(), base_amount, DECIMALS, ctx.accounts.base_token_program.key()),
+            (&ctx.accounts.quote_vault, &ctx.accounts.migrator_quote, ctx.accounts.quote_mint.to_account_info(), quote_amount, ctx.accounts.quote_mint.decimals, ctx.accounts.quote_token_program.key()),
+        ] {
+            transfer_checked(
+                CpiContext::new_with_signer(
+                    program,
+                    TransferChecked { from: from.to_account_info(), mint: m, to: to.to_account_info(), authority: ctx.accounts.curve.to_account_info() },
+                    curve_seeds,
+                ),
+                amount,
+                decimals,
+            )?;
+        }
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                system_program::Transfer { from: ctx.accounts.payer.to_account_info(), to: ctx.accounts.migrator.to_account_info() },
+            ),
+            MIGRATION_RENT,
+        )?;
+
+        let (sqrt_price, liquidity) = compounding_price_and_liquidity(base_amount, quote_amount)?;
+        let mut base_fee = [0u8; 27];
+        base_fee[..8].copy_from_slice(&POOL_FEE_NUMERATOR.to_le_bytes()); // constant fee: no schedule, mode 0
+        let params = InitializeCustomizablePoolParameters {
+            pool_fees: PoolFeeParameters { base_fee: BaseFeeParameters { data: base_fee }, compounding_fee_bps: 1, padding: 0, dynamic_fee: None },
+            sqrt_min_price: DAMM_MIN_SQRT_PRICE,
+            sqrt_max_price: DAMM_MAX_SQRT_PRICE,
+            has_alpha_vault: false,
+            liquidity,
+            sqrt_price,
+            activation_type: 1, // timestamp
+            collect_fee_mode: COLLECT_FEE_COMPOUNDING,
+            activation_point: None,
+        };
+        let migrator_bump = ctx.bumps.migrator;
+        let migrator_seeds: &[&[&[u8]]] = &[&[MIGRATOR_SEED, mint.as_ref(), &[migrator_bump]]];
+        let a = &ctx.accounts;
+        damm_v2::cpi::initialize_customizable_pool(
+            CpiContext::new_with_signer(
+                a.damm_program.key(),
+                damm_v2::cpi::accounts::InitializeCustomizablePool {
+                    creator: a.migrator.to_account_info(),
+                    position_nft_mint: a.position_nft_mint.to_account_info(),
+                    position_nft_account: a.position_nft_account.to_account_info(),
+                    payer: a.migrator.to_account_info(),
+                    pool_authority: a.pool_authority.to_account_info(),
+                    pool: a.pool.to_account_info(),
+                    position: a.position.to_account_info(),
+                    token_a_mint: a.base_mint.to_account_info(),
+                    token_b_mint: a.quote_mint.to_account_info(),
+                    token_a_vault: a.pool_base_vault.to_account_info(),
+                    token_b_vault: a.pool_quote_vault.to_account_info(),
+                    payer_token_a: a.migrator_base.to_account_info(),
+                    payer_token_b: a.migrator_quote.to_account_info(),
+                    token_a_program: a.base_token_program.to_account_info(),
+                    token_b_program: a.quote_token_program.to_account_info(),
+                    token_2022_program: a.token_2022_program.to_account_info(),
+                    system_program: a.system_program.to_account_info(),
+                    event_authority: a.damm_event_authority.to_account_info(),
+                    program: a.damm_program.to_account_info(),
+                },
+                migrator_seeds,
+            ),
+            params,
+        )?;
+        // The whole position, locked forever: nobody can ever withdraw this liquidity, its fees stay claimable.
+        damm_v2::cpi::permanent_lock_position(
+            CpiContext::new_with_signer(
+                a.damm_program.key(),
+                damm_v2::cpi::accounts::PermanentLockPosition {
+                    pool: a.pool.to_account_info(),
+                    position: a.position.to_account_info(),
+                    position_nft_account: a.position_nft_account.to_account_info(),
+                    signer: a.migrator.to_account_info(),
+                    event_authority: a.damm_event_authority.to_account_info(),
+                    program: a.damm_program.to_account_info(),
+                },
+                migrator_seeds,
+            ),
+            liquidity - DAMM_DEAD_LIQUIDITY,
+        )?;
+
+        let curve = &mut ctx.accounts.curve;
+        curve.migrated = true;
+        curve.real_quote = 0;
+        curve.pool = ctx.accounts.pool.key();
+        curve.position = ctx.accounts.position.key();
+        curve.position_nft_account = ctx.accounts.position_nft_account.key();
+        curve.migrator_bump = migrator_bump;
+        emit!(Migrated { mint, pool: curve.pool, base_amount, quote_amount });
+        Ok(())
+    }
+
+    /// Claims the fees of a graduated token's locked pool position and splits them 30/40/30 (platform / creator /
+    /// artist treasury), in the quote token. Permissionless.
+    pub fn claim_pool_fees(ctx: Context<ClaimPoolFees>) -> Result<()> {
+        let curve = &ctx.accounts.curve;
+        require!(curve.migrated, LaunchpadError::CurveNotComplete);
+        let mint = curve.mint;
+        let migrator_seeds: &[&[&[u8]]] = &[&[MIGRATOR_SEED, mint.as_ref(), &[curve.migrator_bump]]];
+        let before = ctx.accounts.migrator_quote.amount;
+        let a = &ctx.accounts;
+        damm_v2::cpi::claim_position_fee(CpiContext::new_with_signer(
+            a.damm_program.key(),
+            damm_v2::cpi::accounts::ClaimPositionFee {
+                pool_authority: a.pool_authority.to_account_info(),
+                pool: a.pool.to_account_info(),
+                position: a.position.to_account_info(),
+                token_a_account: a.migrator_base.to_account_info(),
+                token_b_account: a.migrator_quote.to_account_info(),
+                token_a_vault: a.pool_base_vault.to_account_info(),
+                token_b_vault: a.pool_quote_vault.to_account_info(),
+                token_a_mint: a.base_mint.to_account_info(),
+                token_b_mint: a.quote_mint.to_account_info(),
+                position_nft_account: a.position_nft_account.to_account_info(),
+                signer: a.migrator.to_account_info(),
+                token_a_program: a.base_token_program.to_account_info(),
+                token_b_program: a.quote_token_program.to_account_info(),
+                event_authority: a.damm_event_authority.to_account_info(),
+                program: a.damm_program.to_account_info(),
+            },
+            migrator_seeds,
+        ))?;
+        ctx.accounts.migrator_quote.reload()?;
+        let fee = ctx.accounts.migrator_quote.amount.saturating_sub(before);
+        let platform = (fee as u128 * curve.platform_share_bps as u128 / BPS as u128) as u64;
+        let creator = (fee as u128 * curve.creator_share_bps as u128 / BPS as u128) as u64;
+        let treasury = fee - platform - creator;
+        for (amount, to) in [
+            (platform, ctx.accounts.platform_quote.to_account_info()),
+            (creator, ctx.accounts.creator_quote.to_account_info()),
+            (treasury, ctx.accounts.treasury_quote.to_account_info()),
+        ] {
+            if amount == 0 {
+                continue;
+            }
+            transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.quote_token_program.key(),
+                    TransferChecked {
+                        from: ctx.accounts.migrator_quote.to_account_info(),
+                        mint: ctx.accounts.quote_mint.to_account_info(),
+                        to,
+                        authority: ctx.accounts.migrator.to_account_info(),
+                    },
+                    migrator_seeds,
+                ),
+                amount,
+                ctx.accounts.quote_mint.decimals,
+            )?;
+        }
+        emit!(FeesClaimed { mint, platform, creator, treasury });
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ helpers
@@ -361,6 +549,41 @@ fn validate_metadata(name: &str, symbol: &str, uri: &str) -> Result<()> {
     require!(!symbol.is_empty() && symbol.len() <= 10, LaunchpadError::InvalidMetadata);
     require!(!uri.is_empty() && uri.len() <= 200, LaunchpadError::InvalidMetadata);
     Ok(())
+}
+
+fn isqrt_u256(n: U256) -> U256 {
+    if n.is_zero() {
+        return U256::ZERO;
+    }
+    let mut x: U256 = U256::ONE << (256 - n.leading_zeros()).div_ceil(2);
+    loop {
+        let y = (x + n / x) >> 1;
+        if y >= x {
+            return x;
+        }
+        x = y;
+    }
+}
+
+/// DAMM v2 compounding pool from reserves a (token) and b (quote), as Meteora's own launchpad computes it:
+/// sqrt_price = ceil(sqrt(b·2^128 / a)), liquidity = min(floor(sqrt(b·2^128 / a)) · a, floor(b·2^128 / sqrt_price)), so
+/// the pool pulls ceil(L / sqrt_price) ≤ a and ceil(L · sqrt_price / 2^128) ≤ b. A few units of dust may stay behind.
+pub fn compounding_price_and_liquidity(base_amount: u64, quote_amount: u64) -> Result<(u128, u128)> {
+    require!(base_amount > 0 && quote_amount > 0, LaunchpadError::ZeroAmount);
+    let num: U256 = U256::from(quote_amount) << 128usize;
+    let a: U256 = U256::from(base_amount);
+    let up = isqrt_u256(num.div_ceil(a));
+    let up = if up * up < num.div_ceil(a) { up + U256::ONE } else { up };
+    let down = isqrt_u256(num / a);
+    let sqrt_price = u128::try_from(up).map_err(|_| LaunchpadError::MathOverflow)?;
+    // The pool pulls ceil(L / s) of the token and ceil(L · s / 2^128) of the quote: keep L low enough for both.
+    let from_base = down * a;
+    let from_quote = num / up;
+    let l = if from_base < from_quote { from_base } else { from_quote };
+    let liquidity = u128::try_from(l).map_err(|_| LaunchpadError::MathOverflow)?;
+    require!((DAMM_MIN_SQRT_PRICE..=DAMM_MAX_SQRT_PRICE).contains(&sqrt_price), LaunchpadError::MathOverflow);
+    require!(liquidity > DAMM_DEAD_LIQUIDITY, LaunchpadError::MathOverflow);
+    Ok((sqrt_price, liquidity))
 }
 
 fn fee_of(amount: u64, fee_bps: u16) -> Result<u64> {
@@ -553,6 +776,11 @@ pub struct Curve {
     pub complete: bool,
     pub migrated: bool,
     pub bump: u8,
+    /// After graduation: the DAMM v2 pool and the program's locked position.
+    pub pool: Pubkey,
+    pub position: Pubkey,
+    pub position_nft_account: Pubkey,
+    pub migrator_bump: u8,
 }
 
 impl Curve {
@@ -575,6 +803,10 @@ impl Curve {
         self.complete = false;
         self.migrated = false;
         self.bump = bump;
+        self.pool = Pubkey::default();
+        self.position = Pubkey::default();
+        self.position_nft_account = Pubkey::default();
+        self.migrator_bump = 0;
     }
 
     /// Tokens out for `quote_in` (after fee).
@@ -777,6 +1009,116 @@ pub struct TreasurySpend<'info> {
     pub quote_token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct Migrate<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [CURVE_SEED, curve.mint.as_ref()], bump = curve.bump)]
+    pub curve: Box<Account<'info, Curve>>,
+    #[account(mut, seeds = [MIGRATOR_SEED, curve.mint.as_ref()], bump)]
+    pub migrator: SystemAccount<'info>,
+    #[account(address = curve.mint, mint::token_program = base_token_program)]
+    pub base_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(address = curve.quote_mint, mint::token_program = quote_token_program)]
+    pub quote_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, associated_token::mint = base_mint, associated_token::authority = curve, associated_token::token_program = base_token_program)]
+    pub base_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = curve, associated_token::token_program = quote_token_program)]
+    pub quote_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = base_mint, associated_token::authority = migrator, associated_token::token_program = base_token_program)]
+    pub migrator_base: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = migrator, associated_token::token_program = quote_token_program)]
+    pub migrator_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: new mint for the DAMM v2 position NFT (signer), created by DAMM v2.
+    #[account(mut)]
+    pub position_nft_mint: Signer<'info>,
+    /// CHECK: created and checked by DAMM v2.
+    #[account(mut)]
+    pub position_nft_account: UncheckedAccount<'info>,
+    /// CHECK: DAMM v2 pool authority (checked by DAMM v2).
+    pub pool_authority: UncheckedAccount<'info>,
+    /// CHECK: created and checked by DAMM v2 (seeds: cpool, max(mints), min(mints)).
+    #[account(mut)]
+    pub pool: UncheckedAccount<'info>,
+    /// CHECK: created and checked by DAMM v2.
+    #[account(mut)]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: created and checked by DAMM v2.
+    #[account(mut)]
+    pub pool_base_vault: UncheckedAccount<'info>,
+    /// CHECK: created and checked by DAMM v2.
+    #[account(mut)]
+    pub pool_quote_vault: UncheckedAccount<'info>,
+    pub base_token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Interface<'info, TokenInterface>,
+    pub token_2022_program: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: DAMM v2 event authority (checked by DAMM v2).
+    pub damm_event_authority: UncheckedAccount<'info>,
+    pub damm_program: Program<'info, damm_v2::program::CpAmm>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimPoolFees<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(seeds = [CURVE_SEED, curve.mint.as_ref()], bump = curve.bump, has_one = pool @ LaunchpadError::WrongPool, has_one = position @ LaunchpadError::WrongPool, has_one = position_nft_account @ LaunchpadError::WrongPool)]
+    pub curve: Box<Account<'info, Curve>>,
+    #[account(seeds = [ARTIST_SEED, curve.artist_mint.as_ref()], bump = artist.bump)]
+    pub artist: Box<Account<'info, Artist>>,
+    /// CHECK: the artist's treasury PDA.
+    #[account(seeds = [TREASURY_SEED, curve.artist_mint.as_ref()], bump = artist.treasury_bump)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(mut, seeds = [MIGRATOR_SEED, curve.mint.as_ref()], bump = curve.migrator_bump)]
+    pub migrator: SystemAccount<'info>,
+    #[account(address = curve.mint, mint::token_program = base_token_program)]
+    pub base_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(address = curve.quote_mint, mint::token_program = quote_token_program)]
+    pub quote_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, associated_token::mint = base_mint, associated_token::authority = migrator, associated_token::token_program = base_token_program)]
+    pub migrator_base: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = migrator, associated_token::token_program = quote_token_program)]
+    pub migrator_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: checked against the config.
+    #[account(address = config.platform_wallet @ LaunchpadError::Unauthorized)]
+    pub platform_wallet: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = platform_wallet, associated_token::token_program = quote_token_program)]
+    pub platform_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: checked against the artist.
+    #[account(address = artist.creator @ LaunchpadError::NotArtistCreator)]
+    pub creator: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = creator, associated_token::token_program = quote_token_program)]
+    pub creator_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = treasury, associated_token::token_program = quote_token_program)]
+    pub treasury_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: DAMM v2 pool authority (checked by DAMM v2).
+    pub pool_authority: UncheckedAccount<'info>,
+    /// CHECK: the graduated pool (checked against the curve).
+    #[account(mut)]
+    pub pool: UncheckedAccount<'info>,
+    /// CHECK: the program's locked position (checked against the curve).
+    #[account(mut)]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: checked against the curve.
+    pub position_nft_account: UncheckedAccount<'info>,
+    /// CHECK: checked by DAMM v2.
+    #[account(mut)]
+    pub pool_base_vault: UncheckedAccount<'info>,
+    /// CHECK: checked by DAMM v2.
+    #[account(mut)]
+    pub pool_quote_vault: UncheckedAccount<'info>,
+    pub base_token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    /// CHECK: DAMM v2 event authority (checked by DAMM v2).
+    pub damm_event_authority: UncheckedAccount<'info>,
+    pub damm_program: Program<'info, damm_v2::program::CpAmm>,
+}
+
 // ------------------------------------------------------------------------------------------------ events & errors
 
 #[event]
@@ -827,6 +1169,14 @@ pub struct FeesClaimed {
 }
 
 #[event]
+pub struct Migrated {
+    pub mint: Pubkey,
+    pub pool: Pubkey,
+    pub base_amount: u64,
+    pub quote_amount: u64,
+}
+
+#[event]
 pub struct TreasurySpent {
     pub artist_mint: Pubkey,
     pub quote_mint: Pubkey,
@@ -860,4 +1210,10 @@ pub enum LaunchpadError {
     DailyCapExceeded,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("The curve is not complete yet")]
+    CurveNotComplete,
+    #[msg("Already migrated")]
+    AlreadyMigrated,
+    #[msg("Not this token's pool")]
+    WrongPool,
 }

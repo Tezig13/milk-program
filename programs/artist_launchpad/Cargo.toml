@@ -25,6 +25,8 @@ test-initializer = []
 [dependencies]
 anchor-lang = { version = "1.2.1", features = ["init-if-needed"] }
 anchor-spl = "1.2.1"
+ruint = "1.14.0"
+bytemuck = { version = "1.23", features = ["derive", "min_const_generics"] }
 
 [dev-dependencies]
 litesvm = "0.10.0"

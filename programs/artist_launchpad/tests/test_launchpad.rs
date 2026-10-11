@@ -20,6 +20,7 @@ const TOKEN: Pubkey = spl_token_interface::ID;
 const TOKEN_2022: Pubkey = spl_token_2022_interface::ID;
 const ATA_PROGRAM: Pubkey = spl_associated_token_account_interface::program::ID;
 const SYSTEM: Pubkey = anchor_lang::solana_program::system_program::ID;
+const DAMM: Pubkey = artist_launchpad::damm_v2::ID;
 
 const ARTIST_CURVE: CurveParams = CurveParams { virtual_base: 1_073_000_000 * TOK, virtual_quote: 30 * SOL, curve_supply: 793_100_000 * TOK };
 const SONG_CURVE: CurveParams = CurveParams { virtual_base: 1_073_000_000 * TOK, virtual_quote: 30_000_000 * TOK, curve_supply: 793_100_000 * TOK };
@@ -105,6 +106,8 @@ fn params(env_operator: Pubkey, platform: Pubkey, ops: Pubkey) -> ConfigParams {
 fn setup() -> Env {
     let mut svm = LiteSVM::new();
     svm.add_program(artist_launchpad::id(), include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/artist_launchpad.so"))).unwrap();
+    // Meteora DAMM v2 (cp-amm), the program deployed on mainnet (dumped into tests/fixtures).
+    svm.add_program(DAMM, include_bytes!("../../../tests/fixtures/cp_amm.so")).unwrap();
     let mut clock = svm.get_sysvar::<Clock>();
     clock.unix_timestamp = NOW;
     svm.set_sysvar(&clock);
@@ -532,4 +535,279 @@ fn only_the_admin_changes_the_config() {
     p.fee_bps = 600;
     let admin = env.admin.insecure_clone();
     assert!(send(&mut env.svm, &[ix(admin.pubkey(), p)], &[&admin]).unwrap_err().contains("InvalidConfig"), "fee capped at 5%");
+}
+
+// ------------------------------------------------------------------------------------------------ graduation (DAMM v2)
+
+fn damm_pda(seeds: &[&[u8]]) -> Pubkey {
+    Pubkey::find_program_address(seeds, &DAMM).0
+}
+
+fn compute_budget(units: u32) -> Instruction {
+    let mut data = vec![2u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction::new_with_bytes(Pubkey::from_str_const("ComputeBudget111111111111111111111111111111"), &data, vec![])
+}
+
+#[derive(Debug)]
+struct PoolKeys {
+    pool: Pubkey,
+    position: Pubkey,
+    nft_account: Pubkey,
+    base_vault: Pubkey,
+    quote_vault: Pubkey,
+}
+
+fn pool_keys(mint: &Pubkey, quote: &Pubkey, nft_mint: &Pubkey) -> PoolKeys {
+    let (hi, lo) = if mint.to_bytes() > quote.to_bytes() { (mint, quote) } else { (quote, mint) };
+    let pool = damm_pda(&[b"cpool", hi.as_ref(), lo.as_ref()]);
+    PoolKeys {
+        pool,
+        position: damm_pda(&[b"position", nft_mint.as_ref()]),
+        nft_account: damm_pda(&[b"position_nft_account", nft_mint.as_ref()]),
+        base_vault: damm_pda(&[b"token_vault", mint.as_ref(), pool.as_ref()]),
+        quote_vault: damm_pda(&[b"token_vault", quote.as_ref(), pool.as_ref()]),
+    }
+}
+
+fn migrate(env: &mut Env, payer: &Keypair, mint: &Pubkey) -> Result<PoolKeys, String> {
+    let (quote, qp) = quote_of(&env.svm, mint);
+    let curve = pda(&[b"curve", mint.as_ref()]);
+    let migrator = pda(&[b"migrator", mint.as_ref()]);
+    let nft = Keypair::new();
+    let k = pool_keys(mint, &quote, &nft.pubkey());
+    let ix = Instruction::new_with_bytes(
+        artist_launchpad::id(),
+        &artist_launchpad::instruction::Migrate {}.data(),
+        artist_launchpad::accounts::Migrate {
+            payer: payer.pubkey(),
+            curve,
+            migrator,
+            base_mint: *mint,
+            quote_mint: quote,
+            base_vault: ata(&curve, mint, &TOKEN_2022),
+            quote_vault: ata(&curve, &quote, &qp),
+            migrator_base: ata(&migrator, mint, &TOKEN_2022),
+            migrator_quote: ata(&migrator, &quote, &qp),
+            position_nft_mint: nft.pubkey(),
+            position_nft_account: k.nft_account,
+            pool_authority: damm_pda(&[b"pool_authority"]),
+            pool: k.pool,
+            position: k.position,
+            pool_base_vault: k.base_vault,
+            pool_quote_vault: k.quote_vault,
+            base_token_program: TOKEN_2022,
+            quote_token_program: qp,
+            token_2022_program: TOKEN_2022,
+            associated_token_program: ATA_PROGRAM,
+            system_program: SYSTEM,
+            damm_event_authority: damm_pda(&[b"__event_authority"]),
+            damm_program: DAMM,
+        }
+        .to_account_metas(None),
+    );
+    send(&mut env.svm, &[compute_budget(1_400_000), ix], &[payer, &nft])?;
+    Ok(k)
+}
+
+fn claim_pool_ix(env: &Env, payer: &Pubkey, mint: &Pubkey, creator: &Pubkey) -> Instruction {
+    let c = curve_of(&env.svm, mint);
+    let (quote, qp) = quote_of(&env.svm, mint);
+    let migrator = pda(&[b"migrator", mint.as_ref()]);
+    let treasury = pda(&[b"treasury", c.artist_mint.as_ref()]);
+    Instruction::new_with_bytes(
+        artist_launchpad::id(),
+        &artist_launchpad::instruction::ClaimPoolFees {}.data(),
+        artist_launchpad::accounts::ClaimPoolFees {
+            payer: *payer,
+            config: pda(&[b"config"]),
+            curve: pda(&[b"curve", mint.as_ref()]),
+            artist: pda(&[b"artist", c.artist_mint.as_ref()]),
+            treasury,
+            migrator,
+            base_mint: *mint,
+            quote_mint: quote,
+            migrator_base: ata(&migrator, mint, &TOKEN_2022),
+            migrator_quote: ata(&migrator, &quote, &qp),
+            platform_wallet: env.platform,
+            platform_quote: ata(&env.platform, &quote, &qp),
+            creator: *creator,
+            creator_quote: ata(creator, &quote, &qp),
+            treasury_quote: ata(&treasury, &quote, &qp),
+            pool_authority: damm_pda(&[b"pool_authority"]),
+            pool: c.pool,
+            position: c.position,
+            position_nft_account: c.position_nft_account,
+            pool_base_vault: damm_pda(&[b"token_vault", mint.as_ref(), c.pool.as_ref()]),
+            pool_quote_vault: damm_pda(&[b"token_vault", quote.as_ref(), c.pool.as_ref()]),
+            base_token_program: TOKEN_2022,
+            quote_token_program: qp,
+            associated_token_program: ATA_PROGRAM,
+            system_program: SYSTEM,
+            damm_event_authority: damm_pda(&[b"__event_authority"]),
+            damm_program: DAMM,
+        }
+        .to_account_metas(None),
+    )
+}
+
+/// A trade on the graduated DAMM v2 pool: `buy` = quote in, token out.
+fn pool_swap(env: &mut Env, trader: &Keypair, mint: &Pubkey, buy: bool, amount_in: u64) -> Result<(), String> {
+    use artist_launchpad::damm_v2::{client, types::SwapParameters};
+    let c = curve_of(&env.svm, mint);
+    let (quote, qp) = quote_of(&env.svm, mint);
+    let token = ata(&trader.pubkey(), mint, &TOKEN_2022);
+    let quote_acc = ata(&trader.pubkey(), &quote, &qp);
+    let (input, output) = if buy { (quote_acc, token) } else { (token, quote_acc) };
+    let ix = Instruction::new_with_bytes(
+        DAMM,
+        &client::args::Swap { _params: SwapParameters { amount_in, minimum_amount_out: 0 } }.data(),
+        client::accounts::Swap {
+            pool_authority: damm_pda(&[b"pool_authority"]),
+            pool: c.pool,
+            input_token_account: input,
+            output_token_account: output,
+            token_a_vault: damm_pda(&[b"token_vault", mint.as_ref(), c.pool.as_ref()]),
+            token_b_vault: damm_pda(&[b"token_vault", quote.as_ref(), c.pool.as_ref()]),
+            token_a_mint: *mint,
+            token_b_mint: quote,
+            payer: trader.pubkey(),
+            token_a_program: TOKEN_2022,
+            token_b_program: qp,
+            referral_token_account: None,
+            event_authority: damm_pda(&[b"__event_authority"]),
+            program: DAMM,
+        }
+        .to_account_metas(None),
+    );
+    let (out_mint, out_program) = if buy { (*mint, TOKEN_2022) } else { (quote, qp) };
+    let open = spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
+        &trader.pubkey(), &trader.pubkey(), &out_mint, &out_program,
+    );
+    send(&mut env.svm, &[compute_budget(400_000), open, ix], &[trader])
+}
+
+fn position_of(env: &Env, key: &Pubkey) -> artist_launchpad::damm_v2::accounts::Position {
+    let data = env.svm.get_account(key).unwrap().data;
+    bytemuck::pod_read_unaligned::<artist_launchpad::damm_v2::accounts::Position>(&data[8..8 + std::mem::size_of::<artist_launchpad::damm_v2::accounts::Position>()])
+}
+
+fn pool_of(env: &Env, key: &Pubkey) -> artist_launchpad::damm_v2::accounts::Pool {
+    let data = env.svm.get_account(key).unwrap().data;
+    bytemuck::pod_read_unaligned::<artist_launchpad::damm_v2::accounts::Pool>(&data[8..8 + std::mem::size_of::<artist_launchpad::damm_v2::accounts::Pool>()])
+}
+
+#[test]
+fn a_curve_must_be_sold_out_to_migrate() {
+    let mut env = setup();
+    let creator = funded(&mut env.svm);
+    let jo = launch_artist(&mut env, &creator, "jo");
+    let anyone = funded(&mut env.svm);
+    assert!(migrate(&mut env, &anyone, &jo.mint).unwrap_err().contains("CurveNotComplete"));
+}
+
+#[test]
+fn a_sold_out_artist_graduates_to_a_locked_damm_v2_pool() {
+    let mut env = setup();
+    let creator = funded(&mut env.svm);
+    let jo = launch_artist(&mut env, &creator, "jo");
+    let whale = funded(&mut env.svm);
+    give_wsol(&mut env.svm, &whale.pubkey(), 500 * SOL);
+    buy(&mut env, &whale, &jo.mint, 200 * SOL).unwrap();
+    let raised = curve_of(&env.svm, &jo.mint).real_quote;
+
+    let anyone = funded(&mut env.svm);
+    let k = migrate(&mut env, &anyone, &jo.mint).unwrap();
+    let c = curve_of(&env.svm, &jo.mint);
+    assert!(c.migrated && c.pool == k.pool);
+    assert_eq!(amount(&env.svm, &ata(&jo.curve, &jo.mint, &TOKEN_2022)), 0, "every remaining token went to the pool");
+    let pool_tokens = amount(&env.svm, &k.base_vault);
+    let pool_sol = amount(&env.svm, &k.quote_vault);
+    assert!(pool_tokens > 206_000_000 * TOK && pool_tokens <= TOTAL_SUPPLY - ARTIST_CURVE.curve_supply, "pool holds the 20.7% reserve: {pool_tokens}");
+    assert!(pool_sol <= raised && raised - pool_sol < 10, "pool holds the SOL raised ({pool_sol} of {raised})");
+    // The curve vault keeps exactly the fees not yet claimed.
+    assert_eq!(amount(&env.svm, &ata(&jo.curve, &WSOL, &TOKEN)), c.fees_platform + c.fees_creator + c.fees_treasury);
+
+    let position = position_of(&env, &k.position);
+    assert_eq!(position.unlocked_liquidity, 0, "nothing withdrawable");
+    assert!(position.permanent_locked_liquidity > 0, "locked forever");
+    let pool = pool_of(&env, &k.pool);
+    assert_eq!(pool.collect_fee_mode, 2, "x·y = k, fees in the quote");
+    assert_eq!(pool.token_a_mint, jo.mint);
+    // Graduation price ≈ the curve's last price.
+    let curve_price = c.virtual_quote as f64 / c.virtual_base as f64;
+    let pool_price = (pool.sqrt_price as f64 / 2f64.powi(64)).powi(2);
+    assert!((pool_price / curve_price - 1.0).abs() < 0.35, "pool {pool_price:e} vs curve {curve_price:e}");
+    assert!(migrate(&mut env, &anyone, &jo.mint).unwrap_err().contains("AlreadyMigrated"));
+}
+
+#[test]
+fn pool_fees_keep_flowing_30_40_30_after_graduation() {
+    let mut env = setup();
+    let creator = funded(&mut env.svm);
+    let jo = launch_artist(&mut env, &creator, "jo");
+    let whale = funded(&mut env.svm);
+    give_wsol(&mut env.svm, &whale.pubkey(), 500 * SOL);
+    buy(&mut env, &whale, &jo.mint, 200 * SOL).unwrap();
+    let anyone = funded(&mut env.svm);
+    migrate(&mut env, &anyone, &jo.mint).unwrap();
+    // Claim the curve's own fees first, so the pool fees can be told apart.
+    { let ix = claim_ix(&env, &anyone.pubkey(), &jo.mint, &creator.pubkey()); send(&mut env.svm, &[ix], &[&anyone]).unwrap(); }
+    let treasury = pda(&[b"treasury", jo.mint.as_ref()]);
+    let before = (
+        amount(&env.svm, &ata(&env.platform, &WSOL, &TOKEN)),
+        amount(&env.svm, &ata(&creator.pubkey(), &WSOL, &TOKEN)),
+        amount(&env.svm, &ata(&treasury, &WSOL, &TOKEN)),
+    );
+
+    // Trading on the DAMM v2 pool: buys in SOL, a sell.
+    let fan = funded(&mut env.svm);
+    give_wsol(&mut env.svm, &fan.pubkey(), 50 * SOL);
+    pool_swap(&mut env, &fan, &jo.mint, true, 20 * SOL).unwrap();
+    let got = amount(&env.svm, &ata(&fan.pubkey(), &jo.mint, &TOKEN_2022));
+    assert!(got > 0, "bought $JO on the pool");
+    pool_swap(&mut env, &fan, &jo.mint, false, got / 2).unwrap();
+
+    { let ix = claim_pool_ix(&env, &anyone.pubkey(), &jo.mint, &creator.pubkey()); send(&mut env.svm, &[ix], &[&anyone]).unwrap(); }
+    let after = (
+        amount(&env.svm, &ata(&env.platform, &WSOL, &TOKEN)),
+        amount(&env.svm, &ata(&creator.pubkey(), &WSOL, &TOKEN)),
+        amount(&env.svm, &ata(&treasury, &WSOL, &TOKEN)),
+    );
+    let (p, c, t) = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+    let total = p + c + t;
+    println!("pool fees claimed: {} SOL (platform {}, creator {}, treasury {})", total as f64 / 1e9, p, c, t);
+    assert!(total > 100_000_000, "1% of ~30 SOL traded, minus Meteora's protocol share, reaches us");
+    assert_eq!(p, total * 3 / 10);
+    assert_eq!(c, total * 4 / 10);
+    assert_eq!(t, total - total * 3 / 10 - total * 4 / 10);
+}
+
+#[test]
+fn a_sold_out_song_graduates_to_a_song_artist_pool() {
+    let mut env = setup();
+    let creator = funded(&mut env.svm);
+    let jo = launch_artist(&mut env, &creator, "jo");
+    let a = launch_song(&mut env, &creator, &jo.mint, 0, "a");
+    let whale = funded(&mut env.svm);
+    give_wsol(&mut env.svm, &whale.pubkey(), 500 * SOL);
+    buy(&mut env, &whale, &jo.mint, 60 * SOL).unwrap(); // $JO to buy the song with
+    let jo_bal = amount(&env.svm, &ata(&whale.pubkey(), &jo.mint, &TOKEN_2022));
+    buy(&mut env, &whale, &a.mint, jo_bal).unwrap();
+    assert!(curve_of(&env.svm, &a.mint).complete, "song curve sold out in $JO");
+    let anyone = funded(&mut env.svm);
+    let k = migrate(&mut env, &anyone, &a.mint).unwrap();
+    let pool = pool_of(&env, &k.pool);
+    assert_eq!((pool.token_a_mint, pool.token_b_mint), (a.mint, jo.mint), "a $A/$JO pool");
+    assert!(amount(&env.svm, &k.quote_vault) > 80_000_000 * TOK, "holding the $JO raised");
+
+    // Trading $A against $JO on the pool, fees in $JO split 30/40/30.
+    let fan = funded(&mut env.svm);
+    give_wsol(&mut env.svm, &fan.pubkey(), 20 * SOL);
+    buy(&mut env, &fan, &jo.mint, 10 * SOL).unwrap();
+    let fan_jo = amount(&env.svm, &ata(&fan.pubkey(), &jo.mint, &TOKEN_2022));
+    pool_swap(&mut env, &fan, &a.mint, true, fan_jo / 2).unwrap();
+    { let ix = claim_pool_ix(&env, &anyone.pubkey(), &a.mint, &creator.pubkey()); send(&mut env.svm, &[ix], &[&anyone]).unwrap(); }
+    let treasury = pda(&[b"treasury", jo.mint.as_ref()]);
+    assert!(amount(&env.svm, &ata(&treasury, &jo.mint, &TOKEN_2022)) > 0, "the artist treasury earns $JO from its song's pool");
 }
