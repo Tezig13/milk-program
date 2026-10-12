@@ -59,6 +59,10 @@ fn amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
     TokenAccount::unpack(&svm.get_account(key).unwrap().data[..TokenAccount::LEN]).unwrap().amount
 }
 
+fn jo_supply(svm: &LiteSVM, mint: &Pubkey) -> u64 {
+    Mint::unpack(&svm.get_account(mint).unwrap().data[..Mint::LEN]).unwrap().supply
+}
+
 fn curve_of(svm: &LiteSVM, mint: &Pubkey) -> Curve {
     Curve::try_deserialize(&mut &svm.get_account(&pda(&[b"curve", mint.as_ref()])).unwrap().data[..]).unwrap()
 }
@@ -462,13 +466,18 @@ fn claimed_fees_go_30_40_30() {
     assert_eq!(c.fees_platform + c.fees_creator + c.fees_treasury, 0);
     assert_eq!(amount(&env.svm, &ata(&jo.curve, &WSOL, &TOKEN)), c.real_quote, "the vault keeps exactly the reserves");
 
-    // Song curve: fees in $JO, same split.
+    // Song curve: fees in $JO; platform and creator get theirs, the treasury's 30% is burned.
     let fee = curve_of(&env.svm, &a.mint);
-    let total = fee.fees_platform + fee.fees_creator + fee.fees_treasury;
+    let supply_before = jo_supply(&env.svm, &jo.mint);
     let ix = claim_ix(&env, &anyone.pubkey(), &a.mint, &creator.pubkey());
     send(&mut env.svm, &[ix], &[&anyone]).unwrap();
-    assert_eq!(amount(&env.svm, &ata(&creator.pubkey(), &jo.mint, &TOKEN_2022)), total * 4 / 10);
-    assert_eq!(amount(&env.svm, &ata(&treasury, &jo.mint, &TOKEN_2022)), total - total * 3 / 10 - total * 4 / 10);
+    assert!(fee.fees_treasury > 0);
+    assert_eq!(amount(&env.svm, &ata(&env.platform, &jo.mint, &TOKEN_2022)), fee.fees_platform, "platform 30% in $JO");
+    assert_eq!(amount(&env.svm, &ata(&creator.pubkey(), &jo.mint, &TOKEN_2022)), fee.fees_creator, "creator 40% in $JO");
+    assert_eq!(amount(&env.svm, &ata(&treasury, &jo.mint, &TOKEN_2022)), 0, "the treasury gets no $JO");
+    assert_eq!(supply_before - jo_supply(&env.svm, &jo.mint), fee.fees_treasury, "the treasury's 30% of a song's fees is burned");
+    let c = curve_of(&env.svm, &a.mint);
+    assert_eq!(amount(&env.svm, &ata(&a.curve, &jo.mint, &TOKEN_2022)), c.real_quote, "the song vault keeps exactly the reserves");
     let redirect = { let ix = claim_ix(&env, &anyone.pubkey(), &a.mint, &env.platform); send(&mut env.svm, &[ix], &[&anyone]) };
     assert!(redirect.is_err(), "fees cannot be redirected to another wallet than the artist's creator");
 }
@@ -807,7 +816,12 @@ fn a_sold_out_song_graduates_to_a_song_artist_pool() {
     buy(&mut env, &fan, &jo.mint, 10 * SOL).unwrap();
     let fan_jo = amount(&env.svm, &ata(&fan.pubkey(), &jo.mint, &TOKEN_2022));
     pool_swap(&mut env, &fan, &a.mint, true, fan_jo / 2).unwrap();
+    let supply_before = jo_supply(&env.svm, &jo.mint);
     { let ix = claim_pool_ix(&env, &anyone.pubkey(), &a.mint, &creator.pubkey()); send(&mut env.svm, &[ix], &[&anyone]).unwrap(); }
     let treasury = pda(&[b"treasury", jo.mint.as_ref()]);
-    assert!(amount(&env.svm, &ata(&treasury, &jo.mint, &TOKEN_2022)) > 0, "the artist treasury earns $JO from its song's pool");
+    let burned = supply_before - jo_supply(&env.svm, &jo.mint);
+    let to_creator = amount(&env.svm, &ata(&creator.pubkey(), &jo.mint, &TOKEN_2022));
+    assert_eq!(amount(&env.svm, &ata(&treasury, &jo.mint, &TOKEN_2022)), 0, "a song's pool fees never reach the treasury");
+    assert!(burned > 0 && to_creator > 0, "the creator earns $JO from the song's pool, the treasury share is burned");
+    assert!((burned as i128 - (to_creator as i128 * 3 / 4)).abs() <= 2, "burn 30% vs creator 40%: {burned} vs {to_creator}");
 }
