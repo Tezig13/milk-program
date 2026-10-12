@@ -1,38 +1,37 @@
-//! MILK: AI artists launchpad, on Meteora's Dynamic Bonding Curve.
+//! MILK: AI artists launchpad, on pump.fun.
 //!
-//! Every artist and every song is a token launched by its creator on a Meteora DBC bonding curve, priced in SOL, so it
-//! trades everywhere DBC tokens trade (Jupiter, the trading terminals and bots) from its first second, and graduates to
-//! a Meteora DAMM v2 pool by itself when the curve sells out. This program is what sits around those pools:
+//! Every artist is a pump.fun coin quoted in SOL; every song is a pump.fun coin quoted in its artist's coin (a
+//! "depth 1" coin, pump.fun's custom pairs), so a song is bought with the artist. pump.fun runs the curves, the
+//! graduation to PumpSwap and the trading; bots and terminals see ordinary pump.fun coins. This program is what sits
+//! around them:
 //!
 //! - Registry: an artist (or a song of an artist) exists for the platform once registered here, co-signed by the
 //!   operator (only artists and songs the studio generated) and by the artist's creator (only they release its songs).
-//!   Registration checks on-chain that the DBC pool is ours: one of the platform's two DBC configs, this mint, this
-//!   creator.
-//! - Fees: the DBC configs give the creator 40% of the trading fees (paid by DBC to the creator) and the rest to the
-//!   partner, a PDA of this program (`fees`). Anyone can push the partner share out (`claim_fees`): half to the platform,
-//!   half to the artist's treasury, which makes it 30 / 40 / 30 of what Meteora's protocol share leaves. The same split
-//!   applies to the fees of the program's locked position once graduated (`claim_pool_fees`). The pool creation fee
-//!   every creator pays at launch goes to the platform (`claim_creation_fee`).
+//!   Registration checks the pump.fun bonding curve on-chain: its creator is this token's `vault` (a PDA of this
+//!   program), and for a song, its quote is the artist's coin with the platform's creator fee rate. The creator pays the
+//!   launch fee to the platform there.
+//! - Fees: pump.fun pays a coin's creator fees to its creator, here the token's `vault`, which nobody can sign for
+//!   but this program. Collecting them out of pump.fun (curve and PumpSwap) is permissionless; `distribute_artist` /
+//!   `distribute_song` then split what the vault holds: 30% platform, 40% the artist's creator, 30% the artist's
+//!   treasury (artists, in SOL) or burnt (songs, in the artist's coin).
 //! - Treasury: each artist has a treasury (PDA, wrapped SOL) that pays its generations (music, visuals). The operator
 //!   spends it, within a daily cap, to the platform's ops wallet only; the admin can freeze all treasury spending.
 
 use anchor_lang::prelude::*;
+use anchor_lang::system_program;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token_interface::{transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked};
+use anchor_spl::token_interface::{
+    burn, close_account, sync_native, transfer_checked, Burn, CloseAccount, Mint, SyncNative, TokenAccount, TokenInterface, TransferChecked,
+};
 
 declare_id!("Df5CVncF1g3erUdfa3aGJUUxHELXqnDK3kHzZa33Rrmr");
-
-// Meteora Dynamic Bonding Curve: where the tokens are launched and traded until graduation.
-declare_program!(dynamic_bonding_curve);
-// Meteora DAMM v2 (cp-amm): where they trade after graduation (DBC migrates them itself).
-declare_program!(damm_v2);
 
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const ARTIST_SEED: &[u8] = b"artist";
 pub const SONG_SEED: &[u8] = b"song";
 pub const TREASURY_SEED: &[u8] = b"treasury";
-/// The DBC partner (fee claimer and leftover receiver of the platform's DBC configs).
-pub const FEES_SEED: &[u8] = b"fees";
+/// A token's pump.fun creator: receives its creator fees, signed for only by this program.
+pub const VAULT_SEED: &[u8] = b"vault";
 
 pub const BPS: u64 = 10_000;
 pub const DAY: i64 = 86_400;
@@ -44,11 +43,12 @@ pub const INITIALIZER: Pubkey = pubkey!("ECDVeDxvwxuw5qpqp6W8LheWHT7BCiZ2p1ujwpv
 #[cfg(feature = "test-initializer")]
 pub const INITIALIZER: Pubkey = pubkey!("J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf");
 
-/// Wrapped SOL: the quote of every pool.
+/// Wrapped SOL: the treasuries' currency.
 pub const WSOL: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
-
-pub const SOURCE_CURVE: u8 = 0;
-pub const SOURCE_POOL: u8 = 1;
+/// pump.fun's bonding curve program.
+pub const PUMP: Pubkey = pubkey!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+/// `BondingCurve` account discriminator (sha256("account:BondingCurve")[..8]).
+pub const BONDING_CURVE_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
 
 #[program]
 pub mod artist_launchpad {
@@ -60,12 +60,11 @@ pub mod artist_launchpad {
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key();
         config.bump = ctx.bumps.config;
-        config.fees_bump = ctx.bumps.fees;
         config.apply(&params);
         Ok(())
     }
 
-    /// New DBC configs apply to launches from now on; pools keep the config they were created with.
+    /// New terms apply to launches and distributions from now on.
     pub fn update_config(ctx: Context<AdminOnly>, params: ConfigParams) -> Result<()> {
         params.validate()?;
         ctx.accounts.config.apply(&params);
@@ -77,176 +76,127 @@ pub mod artist_launchpad {
         Ok(())
     }
 
-    /// Kill switch: freezes every treasury's spending (trading and fee claims keep working).
+    /// Kill switch: freezes every treasury's spending (trading and fee distributions keep working).
     pub fn set_treasury_frozen(ctx: Context<AdminOnly>, frozen: bool) -> Result<()> {
         ctx.accounts.config.treasury_frozen = frozen;
         Ok(())
     }
 
-    /// Registers an artist whose token the creator just launched on the platform's artist DBC config (same
-    /// transaction). Co-signed by the operator; the creator pays the rent.
+    /// Registers an artist whose pump.fun coin the creator just launched (same transaction): quoted in SOL, its
+    /// creator this token's vault. Co-signed by the operator; the creator pays the launch fee and the rent.
     pub fn register_artist(ctx: Context<RegisterArtist>) -> Result<()> {
-        let pool = read_virtual_pool(&ctx.accounts.dbc_pool)?;
-        require_keys_eq!(pool.config, ctx.accounts.config.artist_dbc_config, LaunchpadError::WrongPool);
-        require_keys_eq!(pool.base_mint, ctx.accounts.mint.key(), LaunchpadError::WrongPool);
-        require_keys_eq!(pool.creator, ctx.accounts.creator.key(), LaunchpadError::WrongPool);
+        let curve = read_curve(&ctx.accounts.bonding_curve, &ctx.accounts.mint.key())?;
+        require_keys_eq!(curve.creator, ctx.accounts.vault.key(), LaunchpadError::WrongCurve);
+        require!(curve.quote_mint == Pubkey::default() || curve.quote_mint == WSOL, LaunchpadError::WrongCurve);
+        let fee = ctx.accounts.config.artist_launch_fee;
+        pay_launch(&ctx.accounts.creator, &ctx.accounts.platform_wallet, &ctx.accounts.vault, &ctx.accounts.system_program, fee)?;
+
         let artist = &mut ctx.accounts.artist;
         artist.creator = ctx.accounts.creator.key();
         artist.mint = ctx.accounts.mint.key();
-        artist.pool = ctx.accounts.dbc_pool.key();
         artist.song_count = 0;
         artist.spend_day = 0;
         artist.spent_today = 0;
         artist.bump = ctx.bumps.artist;
         artist.treasury_bump = ctx.bumps.treasury;
-        emit!(ArtistRegistered { artist: artist.key(), mint: artist.mint, pool: artist.pool, creator: artist.creator });
+        artist.vault_bump = ctx.bumps.vault;
+        emit!(ArtistRegistered { artist: artist.key(), mint: artist.mint, creator: artist.creator, vault: ctx.accounts.vault.key() });
         Ok(())
     }
 
-    /// Registers a song the artist's creator just launched on the platform's song DBC config (same transaction): its
-    /// index under the artist, and the artist whose treasury its fees feed. Creator + operator.
+    /// Registers a song the artist's creator just launched (same transaction): a pump.fun coin quoted in the artist's
+    /// coin, its creator this token's vault, at least the platform's creator fee rate. Creator + operator.
     pub fn register_song(ctx: Context<RegisterSong>) -> Result<()> {
-        let pool = read_virtual_pool(&ctx.accounts.dbc_pool)?;
-        require_keys_eq!(pool.config, ctx.accounts.config.song_dbc_config, LaunchpadError::WrongPool);
-        require_keys_eq!(pool.base_mint, ctx.accounts.mint.key(), LaunchpadError::WrongPool);
-        require_keys_eq!(pool.creator, ctx.accounts.creator.key(), LaunchpadError::WrongPool);
+        let config = &ctx.accounts.config;
+        let curve = read_curve(&ctx.accounts.bonding_curve, &ctx.accounts.mint.key())?;
+        require_keys_eq!(curve.creator, ctx.accounts.vault.key(), LaunchpadError::WrongCurve);
+        require_keys_eq!(curve.quote_mint, ctx.accounts.artist.mint, LaunchpadError::WrongCurve);
+        require!(curve.creator_fee_bps >= config.song_creator_fee_bps as u64, LaunchpadError::WrongCurve);
+        let fee = config.song_launch_fee;
+        pay_launch(&ctx.accounts.creator, &ctx.accounts.platform_wallet, &ctx.accounts.vault, &ctx.accounts.system_program, fee)?;
+
         let artist = &mut ctx.accounts.artist;
         let index = artist.song_count;
         artist.song_count = index.checked_add(1).ok_or(LaunchpadError::MathOverflow)?;
         let song = &mut ctx.accounts.song;
         song.artist = artist.mint;
         song.mint = ctx.accounts.mint.key();
-        song.pool = ctx.accounts.dbc_pool.key();
         song.index = index;
         song.bump = ctx.bumps.song;
-        emit!(SongRegistered { artist_mint: artist.mint, mint: song.mint, pool: song.pool, index });
+        song.vault_bump = ctx.bumps.vault;
+        emit!(SongRegistered { artist_mint: artist.mint, mint: song.mint, index, vault: ctx.accounts.vault.key() });
         Ok(())
     }
 
-    /// Pushes out the partner's share of a curve's trading fees: half to the platform, half to the artist's treasury.
-    /// Permissionless.
-    pub fn claim_fees(ctx: Context<ClaimFees>) -> Result<()> {
-        let mint = ctx.accounts.base_mint.key();
-        check_owner_of_mint(&ctx.accounts.artist, ctx.accounts.song.as_deref(), mint)?;
-        let pool = read_virtual_pool(&ctx.accounts.dbc_pool)?;
-        let ours = [ctx.accounts.config.artist_dbc_config, ctx.accounts.config.song_dbc_config];
-        require!(ours.contains(&pool.config) && pool.base_mint == mint, LaunchpadError::WrongPool);
-
-        let before = ctx.accounts.fees_quote.amount;
-        let fees_seeds: &[&[&[u8]]] = &[&[FEES_SEED, &[ctx.accounts.config.fees_bump]]];
+    /// Splits what an artist's vault collected from pump.fun (SOL on the curve, wrapped SOL from PumpSwap): 30%
+    /// platform, 40% the artist's creator, 30% its treasury. Permissionless.
+    pub fn distribute_artist(ctx: Context<DistributeArtist>) -> Result<()> {
+        let mint = ctx.accounts.artist.mint;
+        let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, mint.as_ref(), &[ctx.accounts.artist.vault_bump]]];
+        // PumpSwap pays a SOL-quoted coin's creator in wrapped SOL: unwrap it into the vault first
+        if let Some(vault_wsol) = &ctx.accounts.vault_wsol {
+            require_keys_eq!(vault_wsol.owner, ctx.accounts.vault.key(), LaunchpadError::WrongAccount);
+            require_keys_eq!(vault_wsol.mint, WSOL, LaunchpadError::WrongAccount);
+            close_account(CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                CloseAccount { account: vault_wsol.to_account_info(), destination: ctx.accounts.vault.to_account_info(), authority: ctx.accounts.vault.to_account_info() },
+                seeds,
+            ))?;
+        }
+        let keep = Rent::get()?.minimum_balance(0);
+        let total = ctx.accounts.vault.lamports().saturating_sub(keep);
+        let (platform, creator, treasury) = ctx.accounts.config.split(total);
         let a = &ctx.accounts;
-        dynamic_bonding_curve::cpi::claim_trading_fee(
-            CpiContext::new_with_signer(
-                a.dbc_program.key(),
-                dynamic_bonding_curve::cpi::accounts::ClaimTradingFee {
-                    pool_authority: a.dbc_pool_authority.to_account_info(),
-                    config: a.dbc_config.to_account_info(),
-                    pool: a.dbc_pool.to_account_info(),
-                    token_a_account: a.fees_base.to_account_info(),
-                    token_b_account: a.fees_quote.to_account_info(),
-                    base_vault: a.base_vault.to_account_info(),
-                    quote_vault: a.quote_vault.to_account_info(),
-                    base_mint: a.base_mint.to_account_info(),
-                    quote_mint: a.quote_mint.to_account_info(),
-                    fee_claimer: a.fees.to_account_info(),
-                    token_base_program: a.base_token_program.to_account_info(),
-                    token_quote_program: a.quote_token_program.to_account_info(),
-                    event_authority: a.dbc_event_authority.to_account_info(),
-                    program: a.dbc_program.to_account_info(),
-                },
-                fees_seeds,
-            ),
-            u64::MAX,
-            u64::MAX,
-        )?;
-        let mut fees_quote = ctx.accounts.fees_quote.clone();
-        fees_quote.reload()?;
-        let claimed = fees_quote.amount.saturating_sub(before);
-        split(
-            &ctx.accounts.config,
-            &ctx.accounts.fees,
-            &fees_quote,
-            &ctx.accounts.quote_mint,
-            &ctx.accounts.platform_quote,
-            &ctx.accounts.treasury_quote,
-            &ctx.accounts.quote_token_program,
-            fees_seeds,
-            claimed,
-            mint,
-            SOURCE_CURVE,
-        )
+        for (to, amount) in [(a.platform_wallet.to_account_info(), platform), (a.creator.to_account_info(), creator), (a.treasury_wsol.to_account_info(), treasury)] {
+            if amount == 0 {
+                continue;
+            }
+            system_program::transfer(
+                CpiContext::new_with_signer(a.system_program.key(), system_program::Transfer { from: a.vault.to_account_info(), to }, seeds),
+                amount,
+            )?;
+        }
+        if treasury > 0 {
+            sync_native(CpiContext::new(ctx.accounts.token_program.key(), SyncNative { account: ctx.accounts.treasury_wsol.to_account_info() }))?;
+        }
+        emit!(FeesDistributed { mint, platform, creator, treasury, burnt: 0 });
+        Ok(())
     }
 
-    /// Pushes out the pool creation fee the creator paid at launch, to the platform. Permissionless.
-    pub fn claim_creation_fee(ctx: Context<ClaimCreationFee>) -> Result<()> {
-        let pool = read_virtual_pool(&ctx.accounts.dbc_pool)?;
-        let ours = [ctx.accounts.config.artist_dbc_config, ctx.accounts.config.song_dbc_config];
-        require!(ours.contains(&pool.config), LaunchpadError::WrongPool);
-        let fees_seeds: &[&[&[u8]]] = &[&[FEES_SEED, &[ctx.accounts.config.fees_bump]]];
+    /// Splits what a song's vault collected from pump.fun, in the artist's coin: 30% platform, 40% the artist's
+    /// creator, and the treasury's 30% is burnt. Permissionless.
+    pub fn distribute_song(ctx: Context<DistributeSong>) -> Result<()> {
+        let song = &ctx.accounts.song;
+        let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, song.mint.as_ref(), &[song.vault_bump]]];
+        let total = ctx.accounts.vault_tokens.amount;
+        let (platform, creator, burnt) = ctx.accounts.config.split(total);
         let a = &ctx.accounts;
-        dynamic_bonding_curve::cpi::claim_partner_pool_creation_fee(CpiContext::new_with_signer(
-            a.dbc_program.key(),
-            dynamic_bonding_curve::cpi::accounts::ClaimPartnerPoolCreationFee {
-                config: a.dbc_config.to_account_info(),
-                pool: a.dbc_pool.to_account_info(),
-                fee_claimer: a.fees.to_account_info(),
-                fee_receiver: a.platform_wallet.to_account_info(),
-                event_authority: a.dbc_event_authority.to_account_info(),
-                program: a.dbc_program.to_account_info(),
-            },
-            fees_seeds,
-        ))
-    }
-
-    /// After graduation: pushes out the fees of the partner's locked DAMM v2 position (DBC gives it to the fee
-    /// claimer at migration), with the same split. Permissionless.
-    pub fn claim_pool_fees(ctx: Context<ClaimPoolFees>) -> Result<()> {
-        let mint = ctx.accounts.base_mint.key();
-        check_owner_of_mint(&ctx.accounts.artist, ctx.accounts.song.as_deref(), mint)?;
-        let pool = read_damm_pool(&ctx.accounts.pool)?;
-        require!(pool.token_a_mint == mint && pool.token_b_mint == WSOL, LaunchpadError::WrongPool);
-
-        let before = ctx.accounts.fees_quote.amount;
-        let fees_seeds: &[&[&[u8]]] = &[&[FEES_SEED, &[ctx.accounts.config.fees_bump]]];
-        let a = &ctx.accounts;
-        // DAMM v2 checks that the position's NFT sits in an account owned by the signer: only our position.
-        damm_v2::cpi::claim_position_fee(CpiContext::new_with_signer(
-            a.damm_program.key(),
-            damm_v2::cpi::accounts::ClaimPositionFee {
-                pool_authority: a.pool_authority.to_account_info(),
-                pool: a.pool.to_account_info(),
-                position: a.position.to_account_info(),
-                token_a_account: a.fees_base.to_account_info(),
-                token_b_account: a.fees_quote.to_account_info(),
-                token_a_vault: a.pool_base_vault.to_account_info(),
-                token_b_vault: a.pool_quote_vault.to_account_info(),
-                token_a_mint: a.base_mint.to_account_info(),
-                token_b_mint: a.quote_mint.to_account_info(),
-                position_nft_account: a.position_nft_account.to_account_info(),
-                signer: a.fees.to_account_info(),
-                token_a_program: a.base_token_program.to_account_info(),
-                token_b_program: a.quote_token_program.to_account_info(),
-                event_authority: a.damm_event_authority.to_account_info(),
-                program: a.damm_program.to_account_info(),
-            },
-            fees_seeds,
-        ))?;
-        let mut fees_quote = ctx.accounts.fees_quote.clone();
-        fees_quote.reload()?;
-        let claimed = fees_quote.amount.saturating_sub(before);
-        split(
-            &ctx.accounts.config,
-            &ctx.accounts.fees,
-            &fees_quote,
-            &ctx.accounts.quote_mint,
-            &ctx.accounts.platform_quote,
-            &ctx.accounts.treasury_quote,
-            &ctx.accounts.quote_token_program,
-            fees_seeds,
-            claimed,
-            mint,
-            SOURCE_POOL,
-        )
+        for (amount, to) in [(platform, &a.platform_tokens), (creator, &a.creator_tokens)] {
+            if amount == 0 {
+                continue;
+            }
+            transfer_checked(
+                CpiContext::new_with_signer(
+                    a.token_program.key(),
+                    TransferChecked { from: a.vault_tokens.to_account_info(), mint: a.artist_mint.to_account_info(), to: to.to_account_info(), authority: a.vault.to_account_info() },
+                    seeds,
+                ),
+                amount,
+                a.artist_mint.decimals,
+            )?;
+        }
+        if burnt > 0 {
+            burn(
+                CpiContext::new_with_signer(
+                    a.token_program.key(),
+                    Burn { mint: a.artist_mint.to_account_info(), from: a.vault_tokens.to_account_info(), authority: a.vault.to_account_info() },
+                    seeds,
+                ),
+                burnt,
+            )?;
+        }
+        emit!(FeesDistributed { mint: song.mint, platform, creator, treasury: 0, burnt });
+        Ok(())
     }
 
     /// The operator pays an artist's generations (music, visuals) from its treasury, to the platform's ops wallet,
@@ -294,68 +244,36 @@ pub mod artist_launchpad {
 
 // ------------------------------------------------------------------------------------------------ helpers
 
-/// The fees of `mint` belong to this artist: its own token, or one of its registered songs.
-fn check_owner_of_mint(artist: &Account<Artist>, song: Option<&Account<Song>>, mint: Pubkey) -> Result<()> {
-    match song {
-        Some(song) => require!(song.artist == artist.mint && song.mint == mint, LaunchpadError::WrongPool),
-        None => require_keys_eq!(artist.mint, mint, LaunchpadError::WrongPool),
+/// The launch fee to the platform, and the vault's rent: pump.fun pays SOL creator fees into it as lamports, which an
+/// empty account could not take below rent exemption.
+fn pay_launch<'info>(creator: &Signer<'info>, platform: &UncheckedAccount<'info>, vault: &SystemAccount<'info>, system: &Program<'info, System>, fee: u64) -> Result<()> {
+    if fee > 0 {
+        system_program::transfer(CpiContext::new(system.key(), system_program::Transfer { from: creator.to_account_info(), to: platform.to_account_info() }), fee)?;
+    }
+    let rent = Rent::get()?.minimum_balance(0).saturating_sub(vault.lamports());
+    if rent > 0 {
+        system_program::transfer(CpiContext::new(system.key(), system_program::Transfer { from: creator.to_account_info(), to: vault.to_account_info() }), rent)?;
     }
     Ok(())
 }
 
-/// Half (`platform_share_bps`) of the claimed partner fees to the platform, the rest to the artist's treasury.
-#[allow(clippy::too_many_arguments)]
-fn split<'info>(
-    config: &Account<'info, Config>,
-    fees: &SystemAccount<'info>,
-    from: &InterfaceAccount<'info, TokenAccount>,
-    quote_mint: &InterfaceAccount<'info, Mint>,
-    platform_quote: &InterfaceAccount<'info, TokenAccount>,
-    treasury_quote: &InterfaceAccount<'info, TokenAccount>,
-    token_program: &Interface<'info, TokenInterface>,
-    seeds: &[&[&[u8]]],
-    claimed: u64,
-    mint: Pubkey,
-    source: u8,
-) -> Result<()> {
-    let platform = (claimed as u128 * config.platform_share_bps as u128 / BPS as u128) as u64;
-    let treasury = claimed - platform;
-    for (amount, to) in [(platform, platform_quote), (treasury, treasury_quote)] {
-        if amount == 0 {
-            continue;
-        }
-        transfer_checked(
-            CpiContext::new_with_signer(
-                token_program.key(),
-                TransferChecked { from: from.to_account_info(), mint: quote_mint.to_account_info(), to: to.to_account_info(), authority: fees.to_account_info() },
-                seeds,
-            ),
-            amount,
-            quote_mint.decimals,
-        )?;
-    }
-    emit!(FeesClaimed { mint, platform, treasury, source });
-    Ok(())
+/// What registration reads of a pump.fun bonding curve.
+pub struct Curve {
+    pub creator: Pubkey,
+    pub quote_mint: Pubkey,
+    pub creator_fee_bps: u64,
 }
 
-/// A DBC virtual pool's state (the account must belong to the DBC program).
-fn read_virtual_pool(info: &AccountInfo) -> Result<dynamic_bonding_curve::types::PoolState> {
-    require_keys_eq!(*info.owner, dynamic_bonding_curve::ID, LaunchpadError::WrongPool);
+/// The pump.fun bonding curve of `mint`: owned by pump.fun, at its PDA, with the `BondingCurve` layout (8-byte
+/// discriminator, 5 × u64 reserves, complete, creator, mayhem, cashback, quote_mint, creator_fee_bps, ...).
+fn read_curve(info: &AccountInfo, mint: &Pubkey) -> Result<Curve> {
+    require_keys_eq!(*info.owner, PUMP, LaunchpadError::WrongCurve);
+    let (expected, _) = Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &PUMP);
+    require_keys_eq!(info.key(), expected, LaunchpadError::WrongCurve);
     let data = info.try_borrow_data()?;
-    require!(data.len() >= 8 && data[..8] == *dynamic_bonding_curve::accounts::VirtualPool::DISCRIMINATOR, LaunchpadError::WrongPool);
-    let size = core::mem::size_of::<dynamic_bonding_curve::types::PoolState>();
-    require!(data.len() >= 8 + size, LaunchpadError::WrongPool);
-    Ok(bytemuck::pod_read_unaligned(&data[8..8 + size]))
-}
-
-/// A DAMM v2 pool (the account must belong to DAMM v2).
-fn read_damm_pool(info: &AccountInfo) -> Result<damm_v2::accounts::Pool> {
-    require_keys_eq!(*info.owner, damm_v2::ID, LaunchpadError::WrongPool);
-    let data = info.try_borrow_data()?;
-    require!(data.len() >= 8 && data[..8] == *damm_v2::accounts::Pool::DISCRIMINATOR, LaunchpadError::WrongPool);
-    let size = core::mem::size_of::<damm_v2::accounts::Pool>();
-    require!(data.len() >= 8 + size, LaunchpadError::WrongPool);
-    Ok(bytemuck::pod_read_unaligned(&data[8..8 + size]))
+    require!(data.len() >= 123 && data[..8] == BONDING_CURVE_DISCRIMINATOR, LaunchpadError::WrongCurve);
+    let key = |at: usize| Pubkey::new_from_array(data[at..at + 32].try_into().unwrap());
+    Ok(Curve { creator: key(49), quote_mint: key(83), creator_fee_bps: u64::from_le_bytes(data[115..123].try_into().unwrap()) })
 }
 
 // ------------------------------------------------------------------------------------------------ state
@@ -365,19 +283,23 @@ pub struct ConfigParams {
     pub operator: Pubkey,
     pub platform_wallet: Pubkey,
     pub ops_wallet: Pubkey,
-    /// Platform's part of the partner fees (the rest goes to the artist's treasury). 5000 = half.
-    pub platform_share_bps: u16,
+    /// Of the collected creator fees: the platform's part and the artist's creator's part; the rest goes to the
+    /// artist's treasury (artists) or is burnt (songs). 3000 / 4000 = 30 / 40 / 30.
+    pub platform_bps: u16,
+    pub creator_bps: u16,
     pub treasury_daily_cap_bps: u16,
-    /// The platform's DBC configs (fee claimer: the `fees` PDA), artists and songs, both in SOL.
-    pub artist_dbc_config: Pubkey,
-    pub song_dbc_config: Pubkey,
+    /// Paid by the creator to the platform at each launch (lamports).
+    pub artist_launch_fee: u64,
+    pub song_launch_fee: u64,
+    /// The pump.fun creator fee a song must be launched with (in its artist's coin).
+    pub song_creator_fee_bps: u16,
 }
 
 impl ConfigParams {
     fn validate(&self) -> Result<()> {
-        require!(self.platform_share_bps as u64 <= BPS, LaunchpadError::InvalidConfig);
+        require!(self.platform_bps as u64 + self.creator_bps as u64 <= BPS, LaunchpadError::InvalidConfig);
         require!(self.treasury_daily_cap_bps as u64 <= BPS, LaunchpadError::InvalidConfig);
-        require!(self.artist_dbc_config != self.song_dbc_config, LaunchpadError::InvalidConfig);
+        require!(self.song_creator_fee_bps > 0, LaunchpadError::InvalidConfig);
         Ok(())
     }
 }
@@ -388,17 +310,18 @@ pub struct Config {
     pub admin: Pubkey,
     /// Backend key: co-signs registrations, spends treasuries for generations.
     pub operator: Pubkey,
-    /// Owner of the platform's fee accounts.
+    /// Receives the platform's fees and the launch fees.
     pub platform_wallet: Pubkey,
     /// Receives treasury spending (pays the generation providers).
     pub ops_wallet: Pubkey,
-    pub platform_share_bps: u16,
+    pub platform_bps: u16,
+    pub creator_bps: u16,
     pub treasury_daily_cap_bps: u16,
     pub treasury_frozen: bool,
-    pub artist_dbc_config: Pubkey,
-    pub song_dbc_config: Pubkey,
+    pub artist_launch_fee: u64,
+    pub song_launch_fee: u64,
+    pub song_creator_fee_bps: u16,
     pub bump: u8,
-    pub fees_bump: u8,
 }
 
 impl Config {
@@ -406,10 +329,19 @@ impl Config {
         self.operator = p.operator;
         self.platform_wallet = p.platform_wallet;
         self.ops_wallet = p.ops_wallet;
-        self.platform_share_bps = p.platform_share_bps;
+        self.platform_bps = p.platform_bps;
+        self.creator_bps = p.creator_bps;
         self.treasury_daily_cap_bps = p.treasury_daily_cap_bps;
-        self.artist_dbc_config = p.artist_dbc_config;
-        self.song_dbc_config = p.song_dbc_config;
+        self.artist_launch_fee = p.artist_launch_fee;
+        self.song_launch_fee = p.song_launch_fee;
+        self.song_creator_fee_bps = p.song_creator_fee_bps;
+    }
+
+    /// (platform, creator, rest) of `total`.
+    fn split(&self, total: u64) -> (u64, u64, u64) {
+        let platform = (total as u128 * self.platform_bps as u128 / BPS as u128) as u64;
+        let creator = (total as u128 * self.creator_bps as u128 / BPS as u128) as u64;
+        (platform, creator, total - platform - creator)
     }
 }
 
@@ -418,13 +350,12 @@ impl Config {
 pub struct Artist {
     pub creator: Pubkey,
     pub mint: Pubkey,
-    /// Its DBC virtual pool.
-    pub pool: Pubkey,
     pub song_count: u32,
     pub spend_day: i64,
     pub spent_today: u64,
     pub bump: u8,
     pub treasury_bump: u8,
+    pub vault_bump: u8,
 }
 
 #[account]
@@ -433,9 +364,9 @@ pub struct Song {
     /// The artist's mint.
     pub artist: Pubkey,
     pub mint: Pubkey,
-    pub pool: Pubkey,
     pub index: u32,
     pub bump: u8,
+    pub vault_bump: u8,
 }
 
 // ------------------------------------------------------------------------------------------------ accounts
@@ -446,9 +377,6 @@ pub struct InitializeConfig<'info> {
     pub admin: Signer<'info>,
     #[account(init, payer = admin, space = 8 + Config::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
     pub config: Account<'info, Config>,
-    /// The DBC partner PDA (no data).
-    #[account(seeds = [FEES_SEED], bump)]
-    pub fees: SystemAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -472,10 +400,16 @@ pub struct RegisterArtist<'info> {
     /// CHECK: the artist's treasury PDA (only its bump is kept).
     #[account(seeds = [TREASURY_SEED, mint.key().as_ref()], bump)]
     pub treasury: UncheckedAccount<'info>,
-    /// CHECK: the artist token, checked against the pool.
+    /// The token's pump.fun creator.
+    #[account(mut, seeds = [VAULT_SEED, mint.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: the artist coin, checked against its curve.
     pub mint: UncheckedAccount<'info>,
-    /// CHECK: the DBC virtual pool (owner, discriminator, config, mint and creator checked).
-    pub dbc_pool: UncheckedAccount<'info>,
+    /// CHECK: its pump.fun bonding curve (owner, address, discriminator, creator and quote checked).
+    pub bonding_curve: UncheckedAccount<'info>,
+    /// CHECK: checked against the config.
+    #[account(mut, address = config.platform_wallet @ LaunchpadError::Unauthorized)]
+    pub platform_wallet: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -491,137 +425,78 @@ pub struct RegisterSong<'info> {
     pub artist: Box<Account<'info, Artist>>,
     #[account(init, payer = creator, space = 8 + Song::INIT_SPACE, seeds = [SONG_SEED, artist.mint.as_ref(), &artist.song_count.to_le_bytes()], bump)]
     pub song: Box<Account<'info, Song>>,
-    /// CHECK: the song token, checked against the pool.
+    #[account(mut, seeds = [VAULT_SEED, mint.key().as_ref()], bump)]
+    pub vault: SystemAccount<'info>,
+    /// CHECK: the song coin, checked against its curve.
     pub mint: UncheckedAccount<'info>,
-    /// CHECK: the DBC virtual pool (owner, discriminator, config, mint and creator checked).
-    pub dbc_pool: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct ClaimFees<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(mut, seeds = [FEES_SEED], bump = config.fees_bump)]
-    pub fees: SystemAccount<'info>,
-    #[account(seeds = [ARTIST_SEED, artist.mint.as_ref()], bump = artist.bump)]
-    pub artist: Box<Account<'info, Artist>>,
-    /// The song, when the pool is a song's.
-    #[account(seeds = [SONG_SEED, song.artist.as_ref(), &song.index.to_le_bytes()], bump = song.bump)]
-    pub song: Option<Box<Account<'info, Song>>>,
-    /// CHECK: the artist's treasury PDA.
-    #[account(seeds = [TREASURY_SEED, artist.mint.as_ref()], bump = artist.treasury_bump)]
-    pub treasury: UncheckedAccount<'info>,
-    /// CHECK: the DBC virtual pool (checked: ours, this mint).
-    #[account(mut)]
-    pub dbc_pool: UncheckedAccount<'info>,
-    /// CHECK: the pool's DBC config (checked by DBC).
-    pub dbc_config: UncheckedAccount<'info>,
-    /// CHECK: DBC pool authority (checked by DBC).
-    pub dbc_pool_authority: UncheckedAccount<'info>,
-    #[account(mint::token_program = base_token_program)]
-    pub base_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(address = WSOL, mint::token_program = quote_token_program)]
-    pub quote_mint: Box<InterfaceAccount<'info, Mint>>,
-    /// CHECK: checked by DBC.
-    #[account(mut)]
-    pub base_vault: UncheckedAccount<'info>,
-    /// CHECK: checked by DBC.
-    #[account(mut)]
-    pub quote_vault: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = base_mint, associated_token::authority = fees, associated_token::token_program = base_token_program)]
-    pub fees_base: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = fees, associated_token::token_program = quote_token_program)]
-    pub fees_quote: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: checked against the config.
-    #[account(address = config.platform_wallet @ LaunchpadError::Unauthorized)]
-    pub platform_wallet: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = platform_wallet, associated_token::token_program = quote_token_program)]
-    pub platform_quote: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = treasury, associated_token::token_program = quote_token_program)]
-    pub treasury_quote: Box<InterfaceAccount<'info, TokenAccount>>,
-    pub base_token_program: Interface<'info, TokenInterface>,
-    pub quote_token_program: Interface<'info, TokenInterface>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub system_program: Program<'info, System>,
-    /// CHECK: DBC event authority (checked by DBC).
-    pub dbc_event_authority: UncheckedAccount<'info>,
-    pub dbc_program: Program<'info, dynamic_bonding_curve::program::DynamicBondingCurve>,
-}
-
-#[derive(Accounts)]
-pub struct ClaimCreationFee<'info> {
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
-    #[account(mut, seeds = [FEES_SEED], bump = config.fees_bump)]
-    pub fees: SystemAccount<'info>,
-    /// CHECK: the DBC virtual pool (checked: ours).
-    #[account(mut)]
-    pub dbc_pool: UncheckedAccount<'info>,
-    /// CHECK: the pool's DBC config (checked by DBC).
-    pub dbc_config: UncheckedAccount<'info>,
+    /// CHECK: its pump.fun bonding curve (owner, address, discriminator, creator, quote and fee rate checked).
+    pub bonding_curve: UncheckedAccount<'info>,
     /// CHECK: checked against the config.
     #[account(mut, address = config.platform_wallet @ LaunchpadError::Unauthorized)]
     pub platform_wallet: UncheckedAccount<'info>,
-    /// CHECK: DBC event authority (checked by DBC).
-    pub dbc_event_authority: UncheckedAccount<'info>,
-    pub dbc_program: Program<'info, dynamic_bonding_curve::program::DynamicBondingCurve>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct ClaimPoolFees<'info> {
+pub struct DistributeArtist<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
-    #[account(mut, seeds = [FEES_SEED], bump = config.fees_bump)]
-    pub fees: SystemAccount<'info>,
     #[account(seeds = [ARTIST_SEED, artist.mint.as_ref()], bump = artist.bump)]
     pub artist: Box<Account<'info, Artist>>,
-    #[account(seeds = [SONG_SEED, song.artist.as_ref(), &song.index.to_le_bytes()], bump = song.bump)]
-    pub song: Option<Box<Account<'info, Song>>>,
+    #[account(mut, seeds = [VAULT_SEED, artist.mint.as_ref()], bump = artist.vault_bump)]
+    pub vault: SystemAccount<'info>,
+    /// The vault's wrapped SOL (PumpSwap creator fees), closed into the vault when given.
+    #[account(mut)]
+    pub vault_wsol: Option<Box<InterfaceAccount<'info, TokenAccount>>>,
+    /// CHECK: checked against the config.
+    #[account(mut, address = config.platform_wallet @ LaunchpadError::Unauthorized)]
+    pub platform_wallet: UncheckedAccount<'info>,
+    /// CHECK: the artist's creator.
+    #[account(mut, address = artist.creator @ LaunchpadError::NotArtistCreator)]
+    pub creator: UncheckedAccount<'info>,
     /// CHECK: the artist's treasury PDA.
     #[account(seeds = [TREASURY_SEED, artist.mint.as_ref()], bump = artist.treasury_bump)]
     pub treasury: UncheckedAccount<'info>,
-    /// CHECK: DAMM v2 pool authority (checked by DAMM v2).
-    pub pool_authority: UncheckedAccount<'info>,
-    /// CHECK: the graduated DAMM v2 pool (checked: this mint against SOL).
-    pub pool: UncheckedAccount<'info>,
-    /// CHECK: the partner's position (checked by DAMM v2 against its NFT, which the signer must hold).
+    #[account(address = WSOL)]
+    pub wsol_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = wsol_mint, associated_token::authority = treasury, associated_token::token_program = token_program)]
+    pub treasury_wsol: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DistributeSong<'info> {
     #[account(mut)]
-    pub position: UncheckedAccount<'info>,
-    /// CHECK: checked by DAMM v2.
-    pub position_nft_account: UncheckedAccount<'info>,
-    #[account(mint::token_program = base_token_program)]
-    pub base_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(address = WSOL, mint::token_program = quote_token_program)]
-    pub quote_mint: Box<InterfaceAccount<'info, Mint>>,
-    /// CHECK: checked by DAMM v2.
-    #[account(mut)]
-    pub pool_base_vault: UncheckedAccount<'info>,
-    /// CHECK: checked by DAMM v2.
-    #[account(mut)]
-    pub pool_quote_vault: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = base_mint, associated_token::authority = fees, associated_token::token_program = base_token_program)]
-    pub fees_base: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = fees, associated_token::token_program = quote_token_program)]
-    pub fees_quote: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub payer: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(seeds = [ARTIST_SEED, artist.mint.as_ref()], bump = artist.bump)]
+    pub artist: Box<Account<'info, Artist>>,
+    #[account(seeds = [SONG_SEED, artist.mint.as_ref(), &song.index.to_le_bytes()], bump = song.bump, constraint = song.artist == artist.mint @ LaunchpadError::WrongAccount)]
+    pub song: Box<Account<'info, Song>>,
+    #[account(seeds = [VAULT_SEED, song.mint.as_ref()], bump = song.vault_bump)]
+    pub vault: SystemAccount<'info>,
+    #[account(mut, address = artist.mint @ LaunchpadError::WrongAccount, mint::token_program = token_program)]
+    pub artist_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, associated_token::mint = artist_mint, associated_token::authority = vault, associated_token::token_program = token_program)]
+    pub vault_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: checked against the config.
     #[account(address = config.platform_wallet @ LaunchpadError::Unauthorized)]
     pub platform_wallet: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = platform_wallet, associated_token::token_program = quote_token_program)]
-    pub platform_quote: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = treasury, associated_token::token_program = quote_token_program)]
-    pub treasury_quote: Box<InterfaceAccount<'info, TokenAccount>>,
-    pub base_token_program: Interface<'info, TokenInterface>,
-    pub quote_token_program: Interface<'info, TokenInterface>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = artist_mint, associated_token::authority = platform_wallet, associated_token::token_program = token_program)]
+    pub platform_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: the artist's creator.
+    #[account(address = artist.creator @ LaunchpadError::NotArtistCreator)]
+    pub creator: UncheckedAccount<'info>,
+    #[account(init_if_needed, payer = payer, associated_token::mint = artist_mint, associated_token::authority = creator, associated_token::token_program = token_program)]
+    pub creator_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    /// CHECK: DAMM v2 event authority (checked by DAMM v2).
-    pub damm_event_authority: UncheckedAccount<'info>,
-    pub damm_program: Program<'info, damm_v2::program::CpAmm>,
 }
 
 #[derive(Accounts)]
@@ -650,25 +525,27 @@ pub struct TreasurySpend<'info> {
 pub struct ArtistRegistered {
     pub artist: Pubkey,
     pub mint: Pubkey,
-    pub pool: Pubkey,
     pub creator: Pubkey,
+    pub vault: Pubkey,
 }
 
 #[event]
 pub struct SongRegistered {
     pub artist_mint: Pubkey,
     pub mint: Pubkey,
-    pub pool: Pubkey,
     pub index: u32,
+    pub vault: Pubkey,
 }
 
-/// Partner fees pushed out: SOURCE_CURVE (DBC) or SOURCE_POOL (the graduated DAMM v2 position).
+/// A vault's collected creator fees split: in SOL for an artist (`treasury`), in the artist's coin for a song
+/// (`burnt`).
 #[event]
-pub struct FeesClaimed {
+pub struct FeesDistributed {
     pub mint: Pubkey,
     pub platform: u64,
+    pub creator: u64,
     pub treasury: u64,
-    pub source: u8,
+    pub burnt: u64,
 }
 
 #[event]
@@ -697,6 +574,8 @@ pub enum LaunchpadError {
     DailyCapExceeded,
     #[msg("Math overflow")]
     MathOverflow,
-    #[msg("Not this token's pool")]
-    WrongPool,
+    #[msg("Not a MILK pump.fun curve for this token")]
+    WrongCurve,
+    #[msg("Wrong account")]
+    WrongAccount,
 }

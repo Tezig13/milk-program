@@ -1,7 +1,7 @@
 [package]
 name = "artist_launchpad"
 version = "0.1.0"
-description = "MILK: AI artists launchpad on Meteora DBC (registry, fee router, treasuries)"
+description = "MILK: AI artists launchpad on pump.fun (registry, fee vaults, treasuries)"
 edition.workspace = true
 rust-version.workspace = true
 
