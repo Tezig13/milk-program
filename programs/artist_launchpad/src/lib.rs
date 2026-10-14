@@ -1,7 +1,8 @@
 //! MILK: AI artists launchpad, on pump.fun.
 //!
-//! Every artist is a pump.fun coin quoted in SOL; every song is a pump.fun coin quoted in its artist's coin (a
-//! "depth 1" coin, pump.fun's custom pairs), so a song is bought with the artist. pump.fun runs the curves, the
+//! Every artist is a pump.fun coin quoted in SOL; every song is a pump.fun coin quoted in its artist's coin or, the
+//! creator's choice, in $MILK, the platform's own coin (a "depth 1" coin, pump.fun's custom pairs), so a song is bought
+//! with the artist or with $MILK. pump.fun runs the curves, the
 //! graduation to PumpSwap and the trading; bots and terminals see ordinary pump.fun coins. This program is what sits
 //! around them:
 //!
@@ -13,7 +14,7 @@
 //! - Fees: pump.fun pays a coin's creator fees to its creator, here the token's `vault`, which nobody can sign for
 //!   but this program. Collecting them out of pump.fun (curve and PumpSwap) is permissionless; `distribute_artist` /
 //!   `distribute_song` then split what the vault holds: 30% platform, 40% the artist's creator, 30% the artist's
-//!   treasury (artists, in SOL) or burnt (songs, in the artist's coin).
+//!   treasury (artists, in SOL) or burnt (songs, in their quote: the artist's coin or $MILK).
 //! - Treasury: each artist has a treasury (PDA, wrapped SOL) that pays its generations (music, visuals). The operator
 //!   spends it, within a daily cap, to the platform's ops wallet only; the admin can freeze all treasury spending.
 
@@ -105,12 +106,14 @@ pub mod artist_launchpad {
     }
 
     /// Registers a song the artist's creator just launched (same transaction): a pump.fun coin quoted in the artist's
-    /// coin, its creator this token's vault, at least the platform's creator fee rate. Creator + operator.
+    /// coin or, the creator's choice, in $MILK (the platform's coin, `config.milk_mint`); its creator this token's vault,
+    /// at least the platform's creator fee rate. Creator + operator.
     pub fn register_song(ctx: Context<RegisterSong>) -> Result<()> {
         let config = &ctx.accounts.config;
         let curve = read_curve(&ctx.accounts.bonding_curve, &ctx.accounts.mint.key())?;
         require_keys_eq!(curve.creator, ctx.accounts.vault.key(), LaunchpadError::WrongCurve);
-        require_keys_eq!(curve.quote_mint, ctx.accounts.artist.mint, LaunchpadError::WrongCurve);
+        let milk = config.milk_mint != Pubkey::default() && curve.quote_mint == config.milk_mint;
+        require!(curve.quote_mint == ctx.accounts.artist.mint || milk, LaunchpadError::WrongCurve);
         require!(curve.creator_fee_bps >= config.song_creator_fee_bps as u64, LaunchpadError::WrongCurve);
         let fee = config.song_launch_fee;
         pay_launch(&ctx.accounts.creator, &ctx.accounts.platform_wallet, &ctx.accounts.vault, &ctx.accounts.system_program, fee)?;
@@ -122,9 +125,10 @@ pub mod artist_launchpad {
         song.artist = artist.mint;
         song.mint = ctx.accounts.mint.key();
         song.index = index;
+        song.quote = curve.quote_mint;
         song.bump = ctx.bumps.song;
         song.vault_bump = ctx.bumps.vault;
-        emit!(SongRegistered { artist_mint: artist.mint, mint: song.mint, index, vault: ctx.accounts.vault.key() });
+        emit!(SongRegistered { artist_mint: artist.mint, mint: song.mint, index, vault: ctx.accounts.vault.key(), quote: song.quote });
         Ok(())
     }
 
@@ -163,8 +167,8 @@ pub mod artist_launchpad {
         Ok(())
     }
 
-    /// Splits what a song's vault collected from pump.fun, in the artist's coin: 30% platform, 40% the artist's
-    /// creator, and the treasury's 30% is burnt. Permissionless.
+    /// Splits what a song's vault collected from pump.fun, in the song's quote (the artist's coin or $MILK): 30% platform,
+    /// 40% the artist's creator, and the last 30% is burnt. Permissionless.
     pub fn distribute_song(ctx: Context<DistributeSong>) -> Result<()> {
         let song = &ctx.accounts.song;
         let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, song.mint.as_ref(), &[song.vault_bump]]];
@@ -178,18 +182,18 @@ pub mod artist_launchpad {
             transfer_checked(
                 CpiContext::new_with_signer(
                     a.token_program.key(),
-                    TransferChecked { from: a.vault_tokens.to_account_info(), mint: a.artist_mint.to_account_info(), to: to.to_account_info(), authority: a.vault.to_account_info() },
+                    TransferChecked { from: a.vault_tokens.to_account_info(), mint: a.quote_mint.to_account_info(), to: to.to_account_info(), authority: a.vault.to_account_info() },
                     seeds,
                 ),
                 amount,
-                a.artist_mint.decimals,
+                a.quote_mint.decimals,
             )?;
         }
         if burnt > 0 {
             burn(
                 CpiContext::new_with_signer(
                     a.token_program.key(),
-                    Burn { mint: a.artist_mint.to_account_info(), from: a.vault_tokens.to_account_info(), authority: a.vault.to_account_info() },
+                    Burn { mint: a.quote_mint.to_account_info(), from: a.vault_tokens.to_account_info(), authority: a.vault.to_account_info() },
                     seeds,
                 ),
                 burnt,
@@ -291,8 +295,10 @@ pub struct ConfigParams {
     /// Paid by the creator to the platform at each launch (lamports).
     pub artist_launch_fee: u64,
     pub song_launch_fee: u64,
-    /// The pump.fun creator fee a song must be launched with (in its artist's coin).
+    /// The pump.fun creator fee a song must be launched with (in its quote).
     pub song_creator_fee_bps: u16,
+    /// $MILK, the platform's pump.fun coin a song may be quoted in instead of its artist's (default key: none yet).
+    pub milk_mint: Pubkey,
 }
 
 impl ConfigParams {
@@ -321,6 +327,7 @@ pub struct Config {
     pub artist_launch_fee: u64,
     pub song_launch_fee: u64,
     pub song_creator_fee_bps: u16,
+    pub milk_mint: Pubkey,
     pub bump: u8,
 }
 
@@ -335,6 +342,7 @@ impl Config {
         self.artist_launch_fee = p.artist_launch_fee;
         self.song_launch_fee = p.song_launch_fee;
         self.song_creator_fee_bps = p.song_creator_fee_bps;
+        self.milk_mint = p.milk_mint;
     }
 
     /// (platform, creator, rest) of `total`.
@@ -365,6 +373,8 @@ pub struct Song {
     pub artist: Pubkey,
     pub mint: Pubkey,
     pub index: u32,
+    /// What the song is quoted in: its artist's coin, or $MILK.
+    pub quote: Pubkey,
     pub bump: u8,
     pub vault_bump: u8,
 }
@@ -480,19 +490,20 @@ pub struct DistributeSong<'info> {
     pub song: Box<Account<'info, Song>>,
     #[account(seeds = [VAULT_SEED, song.mint.as_ref()], bump = song.vault_bump)]
     pub vault: SystemAccount<'info>,
-    #[account(mut, address = artist.mint @ LaunchpadError::WrongAccount, mint::token_program = token_program)]
-    pub artist_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(mut, associated_token::mint = artist_mint, associated_token::authority = vault, associated_token::token_program = token_program)]
+    /// The song's quote: its fees come in it, and part of them is burnt.
+    #[account(mut, address = song.quote @ LaunchpadError::WrongAccount, mint::token_program = token_program)]
+    pub quote_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, associated_token::mint = quote_mint, associated_token::authority = vault, associated_token::token_program = token_program)]
     pub vault_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: checked against the config.
     #[account(address = config.platform_wallet @ LaunchpadError::Unauthorized)]
     pub platform_wallet: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = artist_mint, associated_token::authority = platform_wallet, associated_token::token_program = token_program)]
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = platform_wallet, associated_token::token_program = token_program)]
     pub platform_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: the artist's creator.
     #[account(address = artist.creator @ LaunchpadError::NotArtistCreator)]
     pub creator: UncheckedAccount<'info>,
-    #[account(init_if_needed, payer = payer, associated_token::mint = artist_mint, associated_token::authority = creator, associated_token::token_program = token_program)]
+    #[account(init_if_needed, payer = payer, associated_token::mint = quote_mint, associated_token::authority = creator, associated_token::token_program = token_program)]
     pub creator_tokens: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -535,6 +546,8 @@ pub struct SongRegistered {
     pub mint: Pubkey,
     pub index: u32,
     pub vault: Pubkey,
+    /// The artist's coin or $MILK.
+    pub quote: Pubkey,
 }
 
 /// A vault's collected creator fees split: in SOL for an artist (`treasury`), in the artist's coin for a song
